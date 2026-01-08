@@ -1,3 +1,5 @@
+#Copyright @ISmartCoder
+#Updates Channel @abirxdhackz
 import asyncio
 import logging
 import os
@@ -15,7 +17,6 @@ from pyrogram.raw.types import InputPeerUser, InputPeerChannel
 from pyrogram.file_id import FileId, FileType, ThumbnailSource
 from config import SESSION_STRING
 import uvicorn
-
 
 logging.basicConfig(
     level=logging.INFO,
@@ -36,7 +37,7 @@ async def ensure_client():
         if user is None:
             try:
                 user = Client(
-                    "stories_user_session",
+                    "SmartUserBot",
                     session_string=SESSION_STRING,
                     workdir="/tmp",
                     in_memory=True,
@@ -64,7 +65,7 @@ async def ensure_client():
             logger.error(f"Failed to check/restart client: {str(e)}")
             try:
                 user = Client(
-                    "stories_user_session",
+                    "SmartUserBot",
                     session_string=SESSION_STRING,
                     workdir="/tmp",
                     in_memory=True,
