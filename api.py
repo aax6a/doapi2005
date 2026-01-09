@@ -1,5 +1,3 @@
-#Copyright @ISmartCoder
-#Updates Channel @abirxdhackz
 import asyncio
 import logging
 import os
@@ -7,10 +5,13 @@ import socket
 import aiohttp
 import uvloop
 import threading
+import re
 from datetime import datetime
 from contextlib import asynccontextmanager
 from fastapi import FastAPI, HTTPException
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, HTMLResponse
+from fastapi.templating import Jinja2Templates
+from fastapi import Request
 from pyrogram import Client
 from pyrogram.raw.functions.stories import GetPeerStories, GetStoriesArchive, GetPinnedStories
 from pyrogram.raw.types import InputPeerUser, InputPeerChannel
@@ -30,6 +31,8 @@ logger = logging.getLogger(__name__)
 
 user = None
 client_lock = threading.Lock()
+
+templates = Jinja2Templates(directory="templates")
 
 async def ensure_client():
     global user
@@ -118,6 +121,23 @@ async def upload_to_tmpfiles(file_path):
         logger.error(f"Error uploading to tmpfiles: {str(e)}")
         return None
 
+def parse_story_url(url):
+    patterns = [
+        r't\.me/([^/]+)/s/(\d+)',
+        r'telegram\.me/([^/]+)/s/(\d+)',
+        r't\.me/c/(\d+)/(\d+)',
+        r'telegram\.me/c/(\d+)/(\d+)'
+    ]
+    
+    for pattern in patterns:
+        match = re.search(pattern, url)
+        if match:
+            username = match.group(1)
+            story_id = int(match.group(2))
+            return username, story_id
+    
+    return None, None
+
 async def resolve_peer_helper(username):
     peer = await user.resolve_peer(username)
     if hasattr(peer, 'user_id'):
@@ -146,6 +166,144 @@ def format_story_info(story, story_type):
         "has_media": hasattr(story, 'media')
     }
 
+async def find_and_download_story(username, storyid):
+    input_peer = await resolve_peer_helper(username)
+    
+    target_story = None
+    story_type = None
+    
+    try:
+        active_result = await user.invoke(
+            GetPeerStories(peer=input_peer)
+        )
+        if active_result and hasattr(active_result, 'stories') and active_result.stories.stories:
+            for story in active_result.stories.stories:
+                if story.id == storyid:
+                    target_story = story
+                    story_type = "Active"
+                    break
+    except:
+        pass
+    
+    if not target_story:
+        try:
+            pinned_result = await user.invoke(
+                GetPinnedStories(
+                    peer=input_peer,
+                    offset_id=0,
+                    limit=100
+                )
+            )
+            if pinned_result and hasattr(pinned_result, 'stories'):
+                for story in pinned_result.stories:
+                    if story.id == storyid:
+                        target_story = story
+                        story_type = "Pinned"
+                        break
+        except:
+            pass
+    
+    if not target_story:
+        try:
+            offset_id = 0
+            while True:
+                archive_result = await user.invoke(
+                    GetStoriesArchive(
+                        peer=input_peer,
+                        offset_id=offset_id,
+                        limit=100
+                    )
+                )
+                
+                if not archive_result or not hasattr(archive_result, 'stories') or not archive_result.stories:
+                    break
+                
+                for story in archive_result.stories:
+                    if story.id == storyid:
+                        target_story = story
+                        story_type = "Archived"
+                        break
+                
+                if target_story:
+                    break
+                
+                if len(archive_result.stories) < 100:
+                    break
+                
+                offset_id = archive_result.stories[-1].id
+        except:
+            pass
+    
+    if not target_story:
+        return None
+    
+    story_date = datetime.fromtimestamp(target_story.date).strftime("%Y-%m-%d %H:%M:%S")
+    caption = getattr(target_story, 'caption', '') if hasattr(target_story, 'caption') else ''
+    
+    media = target_story.media
+    file_path = None
+    media_type = None
+    
+    if hasattr(media, 'photo'):
+        media_type = "photo"
+        file_id_obj = FileId(
+            file_type=FileType.PHOTO,
+            dc_id=media.photo.dc_id,
+            media_id=media.photo.id,
+            access_hash=media.photo.access_hash,
+            file_reference=media.photo.file_reference,
+            thumbnail_source=ThumbnailSource.THUMBNAIL,
+            thumbnail_file_type=FileType.PHOTO,
+            thumbnail_size=""
+        )
+        file_path = await user.download_media(file_id_obj.encode(), file_name="/tmp/")
+        
+    elif hasattr(media, 'document'):
+        doc = media.document
+        mime_type = getattr(doc, 'mime_type', '')
+        
+        if mime_type.startswith('video'):
+            media_type = "video"
+            file_type = FileType.VIDEO
+        else:
+            media_type = "document"
+            file_type = FileType.DOCUMENT
+        
+        file_id_obj = FileId(
+            file_type=file_type,
+            dc_id=doc.dc_id,
+            media_id=doc.id,
+            access_hash=doc.access_hash,
+            file_reference=doc.file_reference,
+            thumbnail_source=ThumbnailSource.THUMBNAIL,
+            thumbnail_file_type=FileType.PHOTO,
+            thumbnail_size=""
+        )
+        file_path = await user.download_media(file_id_obj.encode(), file_name="/tmp/")
+    else:
+        return None
+    
+    upload_url = await upload_to_tmpfiles(file_path)
+    
+    if os.path.exists(file_path):
+        os.remove(file_path)
+    
+    if not upload_url:
+        return None
+    
+    return {
+        "success": True,
+        "username": username,
+        "story_id": storyid,
+        "type": story_type,
+        "media_type": media_type,
+        "date": story_date,
+        "timestamp": target_story.date,
+        "caption": caption,
+        "download_url": upload_url,
+        "expires_in": "60 minutes"
+    }
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     asyncio.set_event_loop_policy(uvloop.EventLoopPolicy())
@@ -168,20 +326,9 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(title="Telegram Stories API", version="1.0.0", lifespan=lifespan)
 
-@app.get("/")
-async def root():
-    return {
-        "status": "online",
-        "api": "Telegram Stories API",
-        "version": "1.0.0",
-        "endpoints": {
-            "/api/current?username={}": "Get current active stories",
-            "/api/all?username={}": "Get all stories (active + pinned + archived)",
-            "/api/special?username={}&storyid={}": "Download specific story by ID"
-        },
-        "api_dev": "@ISmartCoder",
-        "api_channel": "@abirxdhackz"
-    }
+@app.get("/", response_class=HTMLResponse)
+async def root(request: Request):
+    return templates.TemplateResponse("index.html", {"request": request})
 
 @app.get("/api/current")
 async def get_current_stories(username: str):
@@ -325,162 +472,74 @@ async def download_story(username: str, storyid: int):
             }, status_code=500)
         
         logger.info(f"Downloading story {storyid} from {username}")
-        input_peer = await resolve_peer_helper(username)
         
-        target_story = None
-        story_type = None
+        result = await find_and_download_story(username, storyid)
         
-        try:
-            active_result = await user.invoke(
-                GetPeerStories(peer=input_peer)
-            )
-            if active_result and hasattr(active_result, 'stories') and active_result.stories.stories:
-                for story in active_result.stories.stories:
-                    if story.id == storyid:
-                        target_story = story
-                        story_type = "Active"
-                        break
-        except:
-            pass
-        
-        if not target_story:
-            try:
-                pinned_result = await user.invoke(
-                    GetPinnedStories(
-                        peer=input_peer,
-                        offset_id=0,
-                        limit=100
-                    )
-                )
-                if pinned_result and hasattr(pinned_result, 'stories'):
-                    for story in pinned_result.stories:
-                        if story.id == storyid:
-                            target_story = story
-                            story_type = "Pinned"
-                            break
-            except:
-                pass
-        
-        if not target_story:
-            try:
-                offset_id = 0
-                while True:
-                    archive_result = await user.invoke(
-                        GetStoriesArchive(
-                            peer=input_peer,
-                            offset_id=offset_id,
-                            limit=100
-                        )
-                    )
-                    
-                    if not archive_result or not hasattr(archive_result, 'stories') or not archive_result.stories:
-                        break
-                    
-                    for story in archive_result.stories:
-                        if story.id == storyid:
-                            target_story = story
-                            story_type = "Archived"
-                            break
-                    
-                    if target_story:
-                        break
-                    
-                    if len(archive_result.stories) < 100:
-                        break
-                    
-                    offset_id = archive_result.stories[-1].id
-            except:
-                pass
-        
-        if not target_story:
+        if not result:
             return JSONResponse(content={
                 "success": False,
-                "error": "Story not found",
+                "error": "Story not found or download failed",
                 "api_dev": "@ISmartCoder",
                 "api_channel": "@abirxdhackz"
             }, status_code=404)
         
-        story_date = datetime.fromtimestamp(target_story.date).strftime("%Y-%m-%d %H:%M:%S")
-        caption = getattr(target_story, 'caption', '') if hasattr(target_story, 'caption') else ''
+        result["api_dev"] = "@ISmartCoder"
+        result["api_channel"] = "@abirxdhackz"
         
-        media = target_story.media
-        file_path = None
-        media_type = None
+        return JSONResponse(content=result)
         
-        if hasattr(media, 'photo'):
-            media_type = "photo"
-            file_id_obj = FileId(
-                file_type=FileType.PHOTO,
-                dc_id=media.photo.dc_id,
-                media_id=media.photo.id,
-                access_hash=media.photo.access_hash,
-                file_reference=media.photo.file_reference,
-                thumbnail_source=ThumbnailSource.THUMBNAIL,
-                thumbnail_file_type=FileType.PHOTO,
-                thumbnail_size=""
-            )
-            file_path = await user.download_media(file_id_obj.encode(), file_name="/tmp/")
-            
-        elif hasattr(media, 'document'):
-            doc = media.document
-            mime_type = getattr(doc, 'mime_type', '')
-            
-            if mime_type.startswith('video'):
-                media_type = "video"
-                file_type = FileType.VIDEO
-            else:
-                media_type = "document"
-                file_type = FileType.DOCUMENT
-            
-            file_id_obj = FileId(
-                file_type=file_type,
-                dc_id=doc.dc_id,
-                media_id=doc.id,
-                access_hash=doc.access_hash,
-                file_reference=doc.file_reference,
-                thumbnail_source=ThumbnailSource.THUMBNAIL,
-                thumbnail_file_type=FileType.PHOTO,
-                thumbnail_size=""
-            )
-            file_path = await user.download_media(file_id_obj.encode(), file_name="/tmp/")
-        else:
+    except Exception as e:
+        logger.error(f"Error downloading story: {str(e)}")
+        return JSONResponse(content={
+            "success": False,
+            "error": str(e),
+            "api_dev": "@ISmartCoder",
+            "api_channel": "@abirxdhackz"
+        }, status_code=500)
+
+@app.get("/api/direct")
+async def download_story_direct(url: str):
+    try:
+        if not await ensure_client():
             return JSONResponse(content={
                 "success": False,
-                "error": "Unsupported media type",
-                "api_dev": "@ISmartCoder",
-                "api_channel": "@abirxdhackz"
-            }, status_code=400)
-        
-        upload_url = await upload_to_tmpfiles(file_path)
-        
-        if os.path.exists(file_path):
-            os.remove(file_path)
-        
-        if not upload_url:
-            return JSONResponse(content={
-                "success": False,
-                "error": "Failed to upload file",
+                "error": "Client initialization failed",
                 "api_dev": "@ISmartCoder",
                 "api_channel": "@abirxdhackz"
             }, status_code=500)
         
-        return JSONResponse(content={
-            "success": True,
-            "username": username,
-            "story_id": storyid,
-            "type": story_type,
-            "media_type": media_type,
-            "date": story_date,
-            "timestamp": target_story.date,
-            "caption": caption,
-            "download_url": upload_url,
-            "expires_in": "60 minutes",
-            "api_dev": "@ISmartCoder",
-            "api_channel": "@abirxdhackz"
-        })
+        logger.info(f"Processing direct URL: {url}")
+        
+        username, story_id = parse_story_url(url)
+        
+        if not username or not story_id:
+            return JSONResponse(content={
+                "success": False,
+                "error": "Invalid Telegram story URL format. Expected format: https://t.me/username/s/storyid",
+                "api_dev": "@ISmartCoder",
+                "api_channel": "@abirxdhackz"
+            }, status_code=400)
+        
+        logger.info(f"Extracted username: {username}, story_id: {story_id}")
+        
+        result = await find_and_download_story(username, story_id)
+        
+        if not result:
+            return JSONResponse(content={
+                "success": False,
+                "error": "Story not found or download failed",
+                "api_dev": "@ISmartCoder",
+                "api_channel": "@abirxdhackz"
+            }, status_code=404)
+        
+        result["api_dev"] = "@ISmartCoder"
+        result["api_channel"] = "@abirxdhackz"
+        result["source_url"] = url
+        
+        return JSONResponse(content=result)
         
     except Exception as e:
-        logger.error(f"Error downloading story: {str(e)}")
+        logger.error(f"Error processing direct URL: {str(e)}")
         return JSONResponse(content={
             "success": False,
             "error": str(e),
@@ -505,6 +564,7 @@ if __name__ == "__main__":
     print(f"  - /api/current?username=<username>")
     print(f"  - /api/all?username=<username>")
     print(f"  - /api/special?username=<username>&storyid=<id>")
+    print(f"  - /api/direct?url=<telegram_story_url>")
     print(f"{'='*60}\n")
     
     uvicorn.run(app, host="0.0.0.0", port=4747, loop="uvloop")
