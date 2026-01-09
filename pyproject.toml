@@ -11,7 +11,8 @@ dependencies = [
     "tgcrypto",
     "aiohttp",
     "uvloop",
-    "python-dateutil"
+    "python-dateutil",
+    "jinja2"
 ]
 
 [project.scripts]
@@ -27,4 +28,7 @@ include-package-data = true
 [tool.setuptools.packages.find]
 where = ["."]
 include = ["*"]
-exclude = ["templates*", "static*", "assets*", "frontend*", "tests*"]
+exclude = ["tests*"]
+
+[tool.setuptools.package-data]
+"*" = ["templates/*.html", "templates/**/*.html"]
