@@ -6,14 +6,14 @@ A powerful FastAPI-based service for downloading Telegram stories. Fetch active,
 
 ## Features
 
-- ðŸš€ **Beautiful Web Interface** - Interactive web UI for easy story downloads
-- ðŸ“¥ **Download Stories** - Active, pinned, and archived Telegram stories
-- ðŸ”— **Direct URL Support** - Download stories directly from Telegram URLs
-- ðŸ“Š **Story Metadata** - Fetch captions, timestamps, and media types
-- â˜ï¸ **Auto File Hosting** - Automatic temporary file hosting via tmpfiles.org
-- âš¡ **High Performance** - Built with FastAPI, Pyrogram, and uvloop
-- ðŸŽ¨ **Modern Design** - Premium dark theme with responsive layout
-- ðŸ”„ **Real-time Updates** - Live status indicators and notifications
+- **Beautiful Web Interface** - Interactive web UI for easy story downloads
+-  **Download Stories** - Active, pinned, and archived Telegram stories
+-  **Direct URL Support** - Download stories directly from Telegram URLs
+-  **Story Metadata** - Fetch captions, timestamps, and media types
+-  **Auto File Hosting** - Automatic temporary file hosting via tmpfiles.org
+-  **High Performance** - Built with FastAPI, Pyrogram, and uvloop
+-  **Modern Design** - Premium dark theme with responsive layout
+-  **Real-time Updates** - Live status indicators and notifications
 
 ## Live Demo
 
