@@ -2,6 +2,7 @@ import asyncio
 import logging
 import os
 import socket
+import base64
 import aiohttp
 import uvloop
 import threading
@@ -10,12 +11,12 @@ import tempfile
 from datetime import datetime
 from contextlib import asynccontextmanager
 from fastapi import FastAPI, HTTPException
-from fastapi.responses import JSONResponse, HTMLResponse
+from fastapi.responses import JSONResponse, HTMLResponse, Response, StreamingResponse
 from fastapi.templating import Jinja2Templates
 from fastapi import Request
 from pyrogram import Client
 from pyrogram.raw.functions.stories import GetPeerStories, GetStoriesArchive, GetPinnedStories, GetStoriesByID
-from pyrogram.raw.types import InputPeerUser, InputPeerChannel, InputPhoto, InputDocument
+from pyrogram.raw.types import InputPeerUser, InputPeerChannel
 from pyrogram.file_id import FileId, FileType, ThumbnailSource
 from config import SESSION_STRING
 import uvicorn
@@ -95,33 +96,6 @@ def get_local_ip():
         s.close()
     return ip
 
-async def upload_to_tmpfiles(file_path):
-    try:
-        logger.info(f"Uploading {file_path} to tmpfiles.org")
-        
-        async with aiohttp.ClientSession() as session:
-            with open(file_path, 'rb') as f:
-                form = aiohttp.FormData()
-                form.add_field('file', f, filename=os.path.basename(file_path))
-                
-                async with session.post('https://tmpfiles.org/api/v1/upload', data=form) as resp:
-                    if resp.status == 200:
-                        result = await resp.json()
-                        if result.get('status') == 'success':
-                            original_url = result['data']['url']
-                            download_url = original_url.replace('tmpfiles.org/', 'tmpfiles.org/dl/')
-                            logger.info(f"Upload successful: {download_url}")
-                            return download_url
-                        else:
-                            logger.error(f"Upload failed: {result}")
-                            return None
-                    else:
-                        logger.error(f"Upload failed with status: {resp.status}")
-                        return None
-    except Exception as e:
-        logger.error(f"Error uploading to tmpfiles: {str(e)}")
-        return None
-
 def parse_story_url(url):
     """
     Parse Telegram story URL and extract username/chat_id and story_id
@@ -189,35 +163,17 @@ def format_story_info(story, story_type):
         "has_media": hasattr(story, 'media')
     }
 
-async def download_story_media_direct(story, story_id, username):
-    """Download story media directly using Pyrogram's download_media"""
+async def get_story_file_bytes(story):
+    """Get story media as bytes without saving to file"""
     try:
-        # Create a temporary file
-        temp_file = tempfile.NamedTemporaryFile(delete=False, suffix=".jpg")
-        temp_path = temp_file.name
-        temp_file.close()
-        
-        logger.info(f"Attempting to download story {story_id} directly")
-        
-        # Try to download using the story object directly
-        file_path = await user.download_media(
-            message=story,
-            file_name=temp_path,
-            progress=None
-        )
-        
-        if file_path and os.path.exists(file_path):
-            file_size = os.path.getsize(file_path)
-            logger.info(f"Direct download successful: {file_path}, size: {file_size} bytes")
-            return file_path
-        
-        # If direct download fails, try alternative method
-        logger.info("Direct download failed, trying alternative method...")
+        # Create a temporary file in memory
+        import io
         
         # Get media from story
         media = story.media
         
         if hasattr(media, 'photo'):
+            media_type = "photo"
             # For photos
             photo = media.photo
             
@@ -233,11 +189,6 @@ async def download_story_media_direct(story, story_id, username):
                 thumbnail_size=""
             ).encode()
             
-            file_path = await user.download_media(
-                message=file_id,
-                file_name=temp_path
-            )
-            
         elif hasattr(media, 'document'):
             # For documents/videos
             doc = media.document
@@ -245,10 +196,13 @@ async def download_story_media_direct(story, story_id, username):
             # Determine file type
             mime_type = getattr(doc, 'mime_type', '')
             if mime_type.startswith('video'):
+                media_type = "video"
                 file_type = FileType.VIDEO
             elif mime_type.startswith('image'):
+                media_type = "image"
                 file_type = FileType.PHOTO
             else:
+                media_type = "document"
                 file_type = FileType.DOCUMENT
             
             # Create file_id for document
@@ -262,25 +216,23 @@ async def download_story_media_direct(story, story_id, username):
                 thumbnail_file_type=FileType.PHOTO,
                 thumbnail_size=""
             ).encode()
-            
-            file_path = await user.download_media(
-                message=file_id,
-                file_name=temp_path
-            )
+        else:
+            return None, None, None
         
-        if file_path and os.path.exists(file_path):
-            file_size = os.path.getsize(file_path)
-            logger.info(f"Alternative download successful: {file_path}, size: {file_size} bytes")
-            return file_path
+        # Download to bytes
+        file_bytes = await user.download_media(
+            message=file_id,
+            in_memory=True
+        )
         
-        return None
+        return file_bytes, media_type, getattr(doc, 'mime_type', 'image/jpeg') if hasattr(media, 'document') else 'image/jpeg'
         
     except Exception as e:
-        logger.error(f"Error in direct download: {str(e)}")
-        return None
+        logger.error(f"Error getting story bytes: {str(e)}")
+        return None, None, None
 
-async def find_and_download_story_v2(username_or_id, storyid):
-    """Version 2: Simplified and more direct approach"""
+async def download_story_direct_response(username_or_id, storyid):
+    """Download story and return as direct response"""
     try:
         # First, resolve the peer
         input_peer = await resolve_peer_helper(username_or_id)
@@ -292,7 +244,7 @@ async def find_and_download_story_v2(username_or_id, storyid):
         
         if not result or not hasattr(result, 'stories') or not result.stories:
             logger.error(f"No stories returned for ID {storyid}")
-            return None
+            return None, None, None
         
         story = result.stories[0]
         logger.info(f"Successfully retrieved story {storyid}")
@@ -301,71 +253,27 @@ async def find_and_download_story_v2(username_or_id, storyid):
         story_date = datetime.fromtimestamp(story.date).strftime("%Y-%m-%d %H:%M:%S")
         caption = getattr(story, 'caption', '') if hasattr(story, 'caption') else ''
         
-        # Determine media type
-        media = story.media
-        media_type = None
+        # Get file bytes
+        file_bytes, media_type, mime_type = await get_story_file_bytes(story)
         
-        if hasattr(media, 'photo'):
-            media_type = "photo"
-            logger.info("Story contains a photo")
-        elif hasattr(media, 'document'):
-            doc = media.document
-            mime_type = getattr(doc, 'mime_type', '')
-            if mime_type.startswith('video'):
-                media_type = "video"
-                logger.info("Story contains a video")
-            elif mime_type.startswith('image'):
-                media_type = "image"
-                logger.info("Story contains an image")
-            else:
-                media_type = "document"
-                logger.info(f"Story contains a document: {mime_type}")
+        if not file_bytes:
+            logger.error("Failed to get story bytes")
+            return None, None, None
         
-        # Download the media
-        file_path = await download_story_media_direct(story, storyid, username_or_id)
+        logger.info(f"Got {len(file_bytes)} bytes of {media_type}")
         
-        if not file_path or not os.path.exists(file_path):
-            logger.error("Failed to download story media")
-            return None
-        
-        file_size = os.path.getsize(file_path)
-        logger.info(f"Downloaded {file_size} bytes to {file_path}")
-        
-        # Upload to temporary file host
-        logger.info("Uploading to tmpfiles.org...")
-        upload_url = await upload_to_tmpfiles(file_path)
-        
-        # Clean up local file
-        if os.path.exists(file_path):
-            os.remove(file_path)
-            logger.info(f"Cleaned up local file: {file_path}")
-        
-        if not upload_url:
-            logger.error("Failed to upload to tmpfiles.org")
-            return None
-        
-        logger.info(f"Upload successful: {upload_url}")
-        
-        return {
-            "success": True,
+        return file_bytes, media_type, {
             "username": username_or_id,
             "story_id": storyid,
-            "type": "Direct",
-            "media_type": media_type,
             "date": story_date,
-            "timestamp": story.date,
             "caption": caption,
-            "download_url": upload_url,
-            "expires_in": "60 minutes"
+            "timestamp": story.date,
+            "mime_type": mime_type
         }
         
     except Exception as e:
-        logger.error(f"Error in find_and_download_story_v2: {str(e)}", exc_info=True)
-        return None
-
-async def find_and_download_story(username_or_id, storyid):
-    """Main function to find and download story - uses v2 approach"""
-    return await find_and_download_story_v2(username_or_id, storyid)
+        logger.error(f"Error in download_story_direct_response: {str(e)}", exc_info=True)
+        return None, None, None
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -387,7 +295,7 @@ async def lifespan(app: FastAPI):
         await user.stop()
         logger.info("Pyrogram user client stopped")
 
-app = FastAPI(title="Telegram Stories API", version="3.0.0", lifespan=lifespan)
+app = FastAPI(title="Telegram Stories API", version="4.0.0", lifespan=lifespan)
 
 @app.get("/", response_class=HTMLResponse)
 async def root(request: Request):
@@ -525,6 +433,7 @@ async def get_all_stories(username: str):
 
 @app.get("/api/special")
 async def download_story(username: str, storyid: int):
+    """Download story and return as base64 encoded data"""
     try:
         if not await ensure_client():
             return JSONResponse(content={
@@ -536,24 +445,34 @@ async def download_story(username: str, storyid: int):
         
         logger.info(f"Downloading story {storyid} from {username}")
         
-        result = await find_and_download_story(username, storyid)
+        file_bytes, media_type, story_info = await download_story_direct_response(username, storyid)
         
-        if not result:
+        if not file_bytes:
             return JSONResponse(content={
                 "success": False,
-                "error": "Failed to download story. The story might be:\n"
-                        "1. Too large to download\n"
-                        "2. Corrupted\n"
-                        "3. Not accessible for download\n"
-                        "4. Network issue during download",
+                "error": "Failed to download story media",
                 "api_dev": "@ISmartCoder",
                 "api_channel": "@abirxdhackz"
             }, status_code=404)
         
-        result["api_dev"] = "@ISmartCoder"
-        result["api_channel"] = "@abirxdhackz"
+        # Encode to base64
+        base64_data = base64.b64encode(file_bytes).decode('utf-8')
         
-        return JSONResponse(content=result)
+        return JSONResponse(content={
+            "success": True,
+            "username": story_info["username"],
+            "story_id": story_info["story_id"],
+            "type": "Direct",
+            "media_type": media_type,
+            "date": story_info["date"],
+            "timestamp": story_info["timestamp"],
+            "caption": story_info["caption"],
+            "mime_type": story_info["mime_type"],
+            "data": base64_data,
+            "size": len(file_bytes),
+            "api_dev": "@ISmartCoder",
+            "api_channel": "@abirxdhackz"
+        })
         
     except Exception as e:
         logger.error(f"Error downloading story: {str(e)}", exc_info=True)
@@ -566,6 +485,7 @@ async def download_story(username: str, storyid: int):
 
 @app.get("/api/direct")
 async def download_story_direct(url: str):
+    """Download story from direct URL and return as base64"""
     try:
         if not await ensure_client():
             return JSONResponse(content={
@@ -591,25 +511,35 @@ async def download_story_direct(url: str):
         
         logger.info(f"Extracted: {username_or_id}, story_id: {story_id}")
         
-        result = await find_and_download_story(username_or_id, story_id)
+        file_bytes, media_type, story_info = await download_story_direct_response(username_or_id, story_id)
         
-        if not result:
+        if not file_bytes:
             return JSONResponse(content={
                 "success": False,
-                "error": "Failed to download story. Possible issues:\n"
-                        "1. Download timeout\n"
-                        "2. File too large\n"
-                        "3. Temporary server issue\n"
-                        "4. Upload service unavailable",
+                "error": "Failed to download story media",
                 "api_dev": "@ISmartCoder",
                 "api_channel": "@abirxdhackz"
             }, status_code=404)
         
-        result["api_dev"] = "@ISmartCoder"
-        result["api_channel"] = "@abirxdhackz"
-        result["source_url"] = url
+        # Encode to base64
+        base64_data = base64.b64encode(file_bytes).decode('utf-8')
         
-        return JSONResponse(content=result)
+        return JSONResponse(content={
+            "success": True,
+            "username": story_info["username"],
+            "story_id": story_info["story_id"],
+            "type": "Direct",
+            "media_type": media_type,
+            "date": story_info["date"],
+            "timestamp": story_info["timestamp"],
+            "caption": story_info["caption"],
+            "mime_type": story_info["mime_type"],
+            "data": base64_data,
+            "size": len(file_bytes),
+            "source_url": url,
+            "api_dev": "@ISmartCoder",
+            "api_channel": "@abirxdhackz"
+        })
         
     except Exception as e:
         logger.error(f"Error processing direct URL: {str(e)}", exc_info=True)
@@ -618,6 +548,105 @@ async def download_story_direct(url: str):
             "error": f"Processing error: {str(e)}",
             "api_dev": "@ISmartCoder",
             "api_channel": "@abirxdhackz"
+        }, status_code=500)
+
+# New endpoint: Direct file download
+@app.get("/api/download")
+async def download_story_file(username: str, storyid: int):
+    """Download story as direct file download"""
+    try:
+        if not await ensure_client():
+            return JSONResponse(content={
+                "success": False,
+                "error": "Client initialization failed"
+            }, status_code=500)
+        
+        logger.info(f"Downloading story {storyid} from {username} as file")
+        
+        file_bytes, media_type, story_info = await download_story_direct_response(username, storyid)
+        
+        if not file_bytes:
+            return JSONResponse(content={
+                "success": False,
+                "error": "Failed to download story media"
+            }, status_code=404)
+        
+        # Determine file extension
+        if media_type == "photo" or media_type == "image":
+            extension = ".jpg"
+            content_type = "image/jpeg"
+        elif media_type == "video":
+            extension = ".mp4"
+            content_type = "video/mp4"
+        else:
+            extension = ".bin"
+            content_type = "application/octet-stream"
+        
+        filename = f"story_{username}_{storyid}{extension}"
+        
+        return Response(
+            content=file_bytes,
+            media_type=content_type,
+            headers={
+                "Content-Disposition": f'attachment; filename="{filename}"',
+                "Content-Length": str(len(file_bytes))
+            }
+        )
+        
+    except Exception as e:
+        logger.error(f"Error downloading story file: {str(e)}")
+        return JSONResponse(content={
+            "success": False,
+            "error": str(e)
+        }, status_code=500)
+
+# New endpoint: Streaming response
+@app.get("/api/stream")
+async def stream_story(username: str, storyid: int):
+    """Stream story media"""
+    try:
+        if not await ensure_client():
+            return JSONResponse(content={
+                "success": False,
+                "error": "Client initialization failed"
+            }, status_code=500)
+        
+        logger.info(f"Streaming story {storyid} from {username}")
+        
+        file_bytes, media_type, story_info = await download_story_direct_response(username, storyid)
+        
+        if not file_bytes:
+            return JSONResponse(content={
+                "success": False,
+                "error": "Failed to download story media"
+            }, status_code=404)
+        
+        # Create a generator for streaming
+        def iterfile():
+            yield file_bytes
+        
+        # Determine content type
+        if media_type == "photo" or media_type == "image":
+            content_type = "image/jpeg"
+        elif media_type == "video":
+            content_type = "video/mp4"
+        else:
+            content_type = "application/octet-stream"
+        
+        return StreamingResponse(
+            iterfile(),
+            media_type=content_type,
+            headers={
+                "Content-Disposition": f'inline; filename="story_{storyid}"',
+                "Content-Length": str(len(file_bytes))
+            }
+        )
+        
+    except Exception as e:
+        logger.error(f"Error streaming story: {str(e)}")
+        return JSONResponse(content={
+            "success": False,
+            "error": str(e)
         }, status_code=500)
 
 @app.get("/api/check")
@@ -648,13 +677,15 @@ async def check_story(username: str, storyid: int):
                 
                 # Check media type
                 media_type = "unknown"
+                mime_type = "unknown"
                 if hasattr(story, 'media'):
                     media = story.media
                     if hasattr(media, 'photo'):
                         media_type = "photo"
+                        mime_type = "image/jpeg"
                     elif hasattr(media, 'document'):
                         doc = media.document
-                        mime_type = getattr(doc, 'mime_type', '')
+                        mime_type = getattr(doc, 'mime_type', 'application/octet-stream')
                         if mime_type.startswith('video'):
                             media_type = "video"
                         elif mime_type.startswith('image'):
@@ -668,6 +699,7 @@ async def check_story(username: str, storyid: int):
                     "story_id": storyid,
                     "has_media": hasattr(story, 'media'),
                     "media_type": media_type,
+                    "mime_type": mime_type,
                     "date": datetime.fromtimestamp(story.date).strftime("%Y-%m-%d %H:%M:%S"),
                     "caption": getattr(story, 'caption', '')[:100] if hasattr(story, 'caption') else '',
                     "message": "Story exists and is accessible"
@@ -696,86 +728,10 @@ async def check_story(username: str, storyid: int):
             "error": str(e)
         }, status_code=500)
 
-# New debug endpoint to test download
-@app.get("/api/debug_download")
-async def debug_download_story(username: str, storyid: int):
-    """Debug endpoint to test download without upload"""
-    try:
-        if not await ensure_client():
-            return JSONResponse(content={
-                "success": False,
-                "error": "Client initialization failed"
-            })
-        
-        logger.info(f"DEBUG: Testing download for story {storyid} from {username}")
-        
-        # Resolve peer
-        input_peer = await resolve_peer_helper(username)
-        
-        # Get story
-        result = await user.invoke(GetStoriesByID(peer=input_peer, id=[storyid]))
-        
-        if not result or not result.stories:
-            return JSONResponse(content={
-                "success": False,
-                "error": "Story not found"
-            })
-        
-        story = result.stories[0]
-        
-        # Try to download
-        temp_file = tempfile.NamedTemporaryFile(delete=False, suffix=".tmp")
-        temp_path = temp_file.name
-        temp_file.close()
-        
-        try:
-            # Try direct download
-            file_path = await user.download_media(
-                message=story,
-                file_name=temp_path,
-                progress=None
-            )
-            
-            if file_path and os.path.exists(file_path):
-                file_size = os.path.getsize(file_path)
-                
-                # Clean up
-                os.remove(file_path)
-                
-                return JSONResponse(content={
-                    "success": True,
-                    "message": f"Download successful: {file_size} bytes",
-                    "file_size": file_size,
-                    "media_type": "photo" if hasattr(story.media, 'photo') else "video/document"
-                })
-            else:
-                return JSONResponse(content={
-                    "success": False,
-                    "error": "Download returned no file path"
-                })
-                
-        except Exception as e:
-            if os.path.exists(temp_path):
-                os.remove(temp_path)
-            
-            return JSONResponse(content={
-                "success": False,
-                "error": f"Download failed: {str(e)}",
-                "traceback": str(e.__traceback__)
-            })
-        
-    except Exception as e:
-        logger.error(f"Debug error: {str(e)}", exc_info=True)
-        return JSONResponse(content={
-            "success": False,
-            "error": str(e),
-            "traceback": str(e.__traceback__) if hasattr(e, '__traceback__') else "No traceback"
-        })
-
 if __name__ == "__main__":
     local_ip = get_local_ip()
     print(f"\n{'='*60}")
-    print(f"Telegram Stories API Server (Fixed Download Version)")
+    print(f"Telegram Stories API Server (Direct Data Version)")
     print(f"{'='*60}")
     print(f"Local IP: {local_ip}")
     print(f"Port: 4747")
@@ -788,12 +744,13 @@ if __name__ == "__main__":
     print(f"API Endpoints:")
     print(f"  - /api/current?username=<username>")
     print(f"  - /api/all?username=<username>")
-    print(f"  - /api/special?username=<username>&storyid=<id>")
-    print(f"  - /api/direct?url=<telegram_story_url>")
-    print(f"  - /api/check?username=<username>&storyid=<id>")
-    print(f"  - /api/debug_download?username=<username>&storyid=<id> (DEBUG)")
+    print(f"  - /api/special?username=<username>&storyid=<id> (Base64)")
+    print(f"  - /api/direct?url=<telegram_story_url> (Base64)")
+    print(f"  - /api/download?username=<username>&storyid=<id> (File)")
+    print(f"  - /api/stream?username=<username>&storyid=<id> (Stream)")
+    print(f"  - /api/check?username=<username>&storyid=<id> (Check)")
     print(f"{'='*60}")
-    print(f"Note: Using simplified download method for better reliability")
+    print(f"Note: No external uploads - data returned directly")
     print(f"{'='*60}\n")
     
     uvicorn.run(app, host="0.0.0.0", port=4747, loop="uvloop")
