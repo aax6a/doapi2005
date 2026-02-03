@@ -14,11 +14,9 @@ from fastapi.responses import JSONResponse, HTMLResponse
 from fastapi.templating import Jinja2Templates
 from fastapi import Request
 from pyrogram import Client
-from pyrogram.raw.functions.stories import GetPeerStories, GetStoriesArchive, GetPinnedStories
+from pyrogram.raw.functions.stories import GetPeerStories, GetStoriesArchive, GetPinnedStories, GetStoriesByID
 from pyrogram.raw.types import InputPeerUser, InputPeerChannel, InputPhoto, InputDocument
 from pyrogram.file_id import FileId, FileType, ThumbnailSource
-from pyrogram.raw.functions.messages import GetWebPagePreview
-from pyrogram.raw.types import InputMediaPhoto, InputMediaDocument
 from config import SESSION_STRING
 import uvicorn
 
@@ -191,229 +189,183 @@ def format_story_info(story, story_type):
         "has_media": hasattr(story, 'media')
     }
 
-async def download_story_media(story):
-    """Download media from story using multiple methods"""
-    media = story.media
-    file_path = None
-    
+async def download_story_media_direct(story, story_id, username):
+    """Download story media directly using Pyrogram's download_media"""
     try:
+        # Create a temporary file
+        temp_file = tempfile.NamedTemporaryFile(delete=False, suffix=".jpg")
+        temp_path = temp_file.name
+        temp_file.close()
+        
+        logger.info(f"Attempting to download story {story_id} directly")
+        
+        # Try to download using the story object directly
+        file_path = await user.download_media(
+            message=story,
+            file_name=temp_path,
+            progress=None
+        )
+        
+        if file_path and os.path.exists(file_path):
+            file_size = os.path.getsize(file_path)
+            logger.info(f"Direct download successful: {file_path}, size: {file_size} bytes")
+            return file_path
+        
+        # If direct download fails, try alternative method
+        logger.info("Direct download failed, trying alternative method...")
+        
+        # Get media from story
+        media = story.media
+        
         if hasattr(media, 'photo'):
-            # Method 1: Try using InputPhoto
-            try:
-                photo = media.photo
-                input_photo = InputPhoto(
-                    id=photo.id,
-                    access_hash=photo.access_hash,
-                    file_reference=photo.file_reference
-                )
-                
-                # Download photo
-                file_path = await user.download_media(
-                    input_photo,
-                    file_name=tempfile.NamedTemporaryFile(delete=False, suffix=".jpg").name
-                )
-            except Exception as e:
-                logger.warning(f"Method 1 failed for photo: {str(e)}")
-                
-                # Method 2: Try using file_id
-                try:
-                    file_id = FileId(
-                        file_type=FileType.PHOTO,
-                        dc_id=photo.dc_id,
-                        media_id=photo.id,
-                        access_hash=photo.access_hash,
-                        file_reference=photo.file_reference,
-                        thumbnail_source=ThumbnailSource.THUMBNAIL,
-                        thumbnail_file_type=FileType.PHOTO,
-                        thumbnail_size=""
-                    )
-                    
-                    file_path = await user.download_media(
-                        file_id.encode(),
-                        file_name=tempfile.NamedTemporaryFile(delete=False, suffix=".jpg").name
-                    )
-                except Exception as e2:
-                    logger.warning(f"Method 2 failed for photo: {str(e2)}")
-                    
-                    # Method 3: Try alternative download
-                    try:
-                        file_path = await user.download_media(
-                            story,
-                            file_name=tempfile.NamedTemporaryFile(delete=False, suffix=".jpg").name
-                        )
-                    except Exception as e3:
-                        logger.warning(f"Method 3 failed for photo: {str(e3)}")
-        
+            # For photos
+            photo = media.photo
+            
+            # Create file_id for photo
+            file_id = FileId(
+                file_type=FileType.PHOTO,
+                dc_id=photo.dc_id,
+                media_id=photo.id,
+                access_hash=photo.access_hash,
+                file_reference=photo.file_reference,
+                thumbnail_source=ThumbnailSource.THUMBNAIL,
+                thumbnail_file_type=FileType.PHOTO,
+                thumbnail_size=""
+            ).encode()
+            
+            file_path = await user.download_media(
+                message=file_id,
+                file_name=temp_path
+            )
+            
         elif hasattr(media, 'document'):
-            # Method 1: Try using InputDocument
-            try:
-                doc = media.document
-                input_document = InputDocument(
-                    id=doc.id,
-                    access_hash=doc.access_hash,
-                    file_reference=doc.file_reference
-                )
-                
-                file_path = await user.download_media(
-                    input_document,
-                    file_name=tempfile.NamedTemporaryFile(delete=False, suffix=".mp4").name
-                )
-            except Exception as e:
-                logger.warning(f"Method 1 failed for document: {str(e)}")
-                
-                # Method 2: Try using file_id
-                try:
-                    doc = media.document
-                    file_type = FileType.VIDEO if getattr(doc, 'mime_type', '').startswith('video') else FileType.DOCUMENT
-                    
-                    file_id = FileId(
-                        file_type=file_type,
-                        dc_id=doc.dc_id,
-                        media_id=doc.id,
-                        access_hash=doc.access_hash,
-                        file_reference=doc.file_reference,
-                        thumbnail_source=ThumbnailSource.THUMBNAIL,
-                        thumbnail_file_type=FileType.PHOTO,
-                        thumbnail_size=""
-                    )
-                    
-                    file_path = await user.download_media(
-                        file_id.encode(),
-                        file_name=tempfile.NamedTemporaryFile(delete=False, suffix=".mp4").name
-                    )
-                except Exception as e2:
-                    logger.warning(f"Method 2 failed for document: {str(e2)}")
-                    
-                    # Method 3: Try alternative download
-                    try:
-                        file_path = await user.download_media(
-                            story,
-                            file_name=tempfile.NamedTemporaryFile(delete=False, suffix=".mp4").name
-                        )
-                    except Exception as e3:
-                        logger.warning(f"Method 3 failed for document: {str(e3)}")
+            # For documents/videos
+            doc = media.document
+            
+            # Determine file type
+            mime_type = getattr(doc, 'mime_type', '')
+            if mime_type.startswith('video'):
+                file_type = FileType.VIDEO
+            elif mime_type.startswith('image'):
+                file_type = FileType.PHOTO
+            else:
+                file_type = FileType.DOCUMENT
+            
+            # Create file_id for document
+            file_id = FileId(
+                file_type=file_type,
+                dc_id=doc.dc_id,
+                media_id=doc.id,
+                access_hash=doc.access_hash,
+                file_reference=doc.file_reference,
+                thumbnail_source=ThumbnailSource.THUMBNAIL,
+                thumbnail_file_type=FileType.PHOTO,
+                thumbnail_size=""
+            ).encode()
+            
+            file_path = await user.download_media(
+                message=file_id,
+                file_name=temp_path
+            )
         
-        return file_path
+        if file_path and os.path.exists(file_path):
+            file_size = os.path.getsize(file_path)
+            logger.info(f"Alternative download successful: {file_path}, size: {file_size} bytes")
+            return file_path
+        
+        return None
         
     except Exception as e:
-        logger.error(f"Error downloading story media: {str(e)}")
+        logger.error(f"Error in direct download: {str(e)}")
+        return None
+
+async def find_and_download_story_v2(username_or_id, storyid):
+    """Version 2: Simplified and more direct approach"""
+    try:
+        # First, resolve the peer
+        input_peer = await resolve_peer_helper(username_or_id)
+        logger.info(f"Resolved peer for {username_or_id}")
+        
+        # Get the story directly by ID
+        logger.info(f"Getting story {storyid} directly...")
+        result = await user.invoke(GetStoriesByID(peer=input_peer, id=[storyid]))
+        
+        if not result or not hasattr(result, 'stories') or not result.stories:
+            logger.error(f"No stories returned for ID {storyid}")
+            return None
+        
+        story = result.stories[0]
+        logger.info(f"Successfully retrieved story {storyid}")
+        
+        # Get story info
+        story_date = datetime.fromtimestamp(story.date).strftime("%Y-%m-%d %H:%M:%S")
+        caption = getattr(story, 'caption', '') if hasattr(story, 'caption') else ''
+        
+        # Determine media type
+        media = story.media
+        media_type = None
+        
+        if hasattr(media, 'photo'):
+            media_type = "photo"
+            logger.info("Story contains a photo")
+        elif hasattr(media, 'document'):
+            doc = media.document
+            mime_type = getattr(doc, 'mime_type', '')
+            if mime_type.startswith('video'):
+                media_type = "video"
+                logger.info("Story contains a video")
+            elif mime_type.startswith('image'):
+                media_type = "image"
+                logger.info("Story contains an image")
+            else:
+                media_type = "document"
+                logger.info(f"Story contains a document: {mime_type}")
+        
+        # Download the media
+        file_path = await download_story_media_direct(story, storyid, username_or_id)
+        
+        if not file_path or not os.path.exists(file_path):
+            logger.error("Failed to download story media")
+            return None
+        
+        file_size = os.path.getsize(file_path)
+        logger.info(f"Downloaded {file_size} bytes to {file_path}")
+        
+        # Upload to temporary file host
+        logger.info("Uploading to tmpfiles.org...")
+        upload_url = await upload_to_tmpfiles(file_path)
+        
+        # Clean up local file
+        if os.path.exists(file_path):
+            os.remove(file_path)
+            logger.info(f"Cleaned up local file: {file_path}")
+        
+        if not upload_url:
+            logger.error("Failed to upload to tmpfiles.org")
+            return None
+        
+        logger.info(f"Upload successful: {upload_url}")
+        
+        return {
+            "success": True,
+            "username": username_or_id,
+            "story_id": storyid,
+            "type": "Direct",
+            "media_type": media_type,
+            "date": story_date,
+            "timestamp": story.date,
+            "caption": caption,
+            "download_url": upload_url,
+            "expires_in": "60 minutes"
+        }
+        
+    except Exception as e:
+        logger.error(f"Error in find_and_download_story_v2: {str(e)}", exc_info=True)
         return None
 
 async def find_and_download_story(username_or_id, storyid):
-    try:
-        input_peer = await resolve_peer_helper(username_or_id)
-    except HTTPException as e:
-        logger.error(f"Failed to resolve peer {username_or_id}: {str(e)}")
-        return None
-    
-    target_story = None
-    story_type = None
-    
-    # Try multiple methods to get the story
-    methods = [
-        ("Active", lambda: user.invoke(GetPeerStories(peer=input_peer))),
-        ("Pinned", lambda: user.invoke(GetPinnedStories(peer=input_peer, offset_id=0, limit=100))),
-        ("Archived", lambda: user.invoke(GetStoriesArchive(peer=input_peer, offset_id=0, limit=100)))
-    ]
-    
-    for method_name, method_func in methods:
-        try:
-            result = await method_func()
-            
-            if result and hasattr(result, 'stories'):
-                stories = []
-                if hasattr(result.stories, 'stories'):
-                    stories = result.stories.stories
-                elif hasattr(result, 'stories'):
-                    stories = result.stories
-                
-                for story in stories:
-                    if story.id == storyid:
-                        target_story = story
-                        story_type = method_name
-                        logger.info(f"Found story {storyid} in {method_name} stories")
-                        break
-                
-                if target_story:
-                    break
-        except Exception as e:
-            logger.warning(f"Error getting {method_name} stories: {str(e)}")
-            continue
-    
-    if not target_story:
-        logger.error(f"Story {storyid} not found for {username_or_id}")
-        
-        # Try one more method: check if it's a public story
-        try:
-            # Try to get story by ID directly
-            from pyrogram.raw.functions.stories import GetStoriesByID
-            result = await user.invoke(GetStoriesByID(peer=input_peer, id=[storyid]))
-            if result and hasattr(result, 'stories') and result.stories:
-                target_story = result.stories[0]
-                story_type = "Direct"
-                logger.info(f"Found story {storyid} using direct method")
-        except Exception as e:
-            logger.warning(f"Direct method also failed: {str(e)}")
-            return None
-    
-    if not target_story:
-        return None
-    
-    # Download the story media
-    story_date = datetime.fromtimestamp(target_story.date).strftime("%Y-%m-%d %H:%M:%S")
-    caption = getattr(target_story, 'caption', '') if hasattr(target_story, 'caption') else ''
-    
-    # Determine media type
-    media = target_story.media
-    media_type = None
-    
-    if hasattr(media, 'photo'):
-        media_type = "photo"
-    elif hasattr(media, 'document'):
-        doc = media.document
-        mime_type = getattr(doc, 'mime_type', '')
-        if mime_type.startswith('video'):
-            media_type = "video"
-        elif mime_type.startswith('image'):
-            media_type = "image"
-        else:
-            media_type = "document"
-    
-    logger.info(f"Downloading {media_type} story {storyid}")
-    
-    # Download media
-    file_path = await download_story_media(target_story)
-    
-    if not file_path or not os.path.exists(file_path):
-        logger.error(f"Failed to download story media")
-        return None
-    
-    file_size = os.path.getsize(file_path) if os.path.exists(file_path) else 0
-    logger.info(f"Story downloaded to: {file_path}, size: {file_size} bytes")
-    
-    # Upload to temporary file host
-    upload_url = await upload_to_tmpfiles(file_path)
-    
-    # Clean up local file
-    if os.path.exists(file_path):
-        os.remove(file_path)
-    
-    if not upload_url:
-        logger.error("Failed to upload to tmpfiles.org")
-        return None
-    
-    return {
-        "success": True,
-        "username": username_or_id,
-        "story_id": storyid,
-        "type": story_type,
-        "media_type": media_type,
-        "date": story_date,
-        "timestamp": target_story.date,
-        "caption": caption,
-        "download_url": upload_url,
-        "expires_in": "60 minutes"
-    }
+    """Main function to find and download story - uses v2 approach"""
+    return await find_and_download_story_v2(username_or_id, storyid)
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -435,7 +387,7 @@ async def lifespan(app: FastAPI):
         await user.stop()
         logger.info("Pyrogram user client stopped")
 
-app = FastAPI(title="Telegram Stories API", version="2.0.0", lifespan=lifespan)
+app = FastAPI(title="Telegram Stories API", version="3.0.0", lifespan=lifespan)
 
 @app.get("/", response_class=HTMLResponse)
 async def root(request: Request):
@@ -589,11 +541,11 @@ async def download_story(username: str, storyid: int):
         if not result:
             return JSONResponse(content={
                 "success": False,
-                "error": "Story not found or download failed. Possible reasons:\n"
-                        "1. Story has been deleted\n"
-                        "2. Story is private\n"
-                        "3. You don't have access to view this story\n"
-                        "4. The user has restricted story viewing",
+                "error": "Failed to download story. The story might be:\n"
+                        "1. Too large to download\n"
+                        "2. Corrupted\n"
+                        "3. Not accessible for download\n"
+                        "4. Network issue during download",
                 "api_dev": "@ISmartCoder",
                 "api_channel": "@abirxdhackz"
             }, status_code=404)
@@ -604,10 +556,10 @@ async def download_story(username: str, storyid: int):
         return JSONResponse(content=result)
         
     except Exception as e:
-        logger.error(f"Error downloading story: {str(e)}")
+        logger.error(f"Error downloading story: {str(e)}", exc_info=True)
         return JSONResponse(content={
             "success": False,
-            "error": str(e),
+            "error": f"Server error: {str(e)}",
             "api_dev": "@ISmartCoder",
             "api_channel": "@abirxdhackz"
         }, status_code=500)
@@ -644,12 +596,11 @@ async def download_story_direct(url: str):
         if not result:
             return JSONResponse(content={
                 "success": False,
-                "error": "Story not found or download failed. Possible reasons:\n"
-                        "1. Story has been deleted\n"
-                        "2. Story is private\n"
-                        "3. You don't have access to view this story\n"
-                        "4. The user has restricted story viewing\n"
-                        "5. Story ID might be incorrect",
+                "error": "Failed to download story. Possible issues:\n"
+                        "1. Download timeout\n"
+                        "2. File too large\n"
+                        "3. Temporary server issue\n"
+                        "4. Upload service unavailable",
                 "api_dev": "@ISmartCoder",
                 "api_channel": "@abirxdhackz"
             }, status_code=404)
@@ -661,15 +612,14 @@ async def download_story_direct(url: str):
         return JSONResponse(content=result)
         
     except Exception as e:
-        logger.error(f"Error processing direct URL: {str(e)}")
+        logger.error(f"Error processing direct URL: {str(e)}", exc_info=True)
         return JSONResponse(content={
             "success": False,
-            "error": str(e),
+            "error": f"Processing error: {str(e)}",
             "api_dev": "@ISmartCoder",
             "api_channel": "@abirxdhackz"
         }, status_code=500)
 
-# New endpoint to check if story exists
 @app.get("/api/check")
 async def check_story(username: str, storyid: int):
     try:
@@ -691,17 +641,35 @@ async def check_story(username: str, storyid: int):
         
         # Try to get story info
         try:
-            from pyrogram.raw.functions.stories import GetStoriesByID
             result = await user.invoke(GetStoriesByID(peer=input_peer, id=[storyid]))
             
             if result and hasattr(result, 'stories') and result.stories:
                 story = result.stories[0]
+                
+                # Check media type
+                media_type = "unknown"
+                if hasattr(story, 'media'):
+                    media = story.media
+                    if hasattr(media, 'photo'):
+                        media_type = "photo"
+                    elif hasattr(media, 'document'):
+                        doc = media.document
+                        mime_type = getattr(doc, 'mime_type', '')
+                        if mime_type.startswith('video'):
+                            media_type = "video"
+                        elif mime_type.startswith('image'):
+                            media_type = "image"
+                        else:
+                            media_type = "document"
+                
                 return JSONResponse(content={
                     "success": True,
                     "exists": True,
                     "story_id": storyid,
                     "has_media": hasattr(story, 'media'),
+                    "media_type": media_type,
                     "date": datetime.fromtimestamp(story.date).strftime("%Y-%m-%d %H:%M:%S"),
+                    "caption": getattr(story, 'caption', '')[:100] if hasattr(story, 'caption') else '',
                     "message": "Story exists and is accessible"
                 })
             else:
@@ -728,10 +696,86 @@ async def check_story(username: str, storyid: int):
             "error": str(e)
         }, status_code=500)
 
+# New debug endpoint to test download
+@app.get("/api/debug_download")
+async def debug_download_story(username: str, storyid: int):
+    """Debug endpoint to test download without upload"""
+    try:
+        if not await ensure_client():
+            return JSONResponse(content={
+                "success": False,
+                "error": "Client initialization failed"
+            })
+        
+        logger.info(f"DEBUG: Testing download for story {storyid} from {username}")
+        
+        # Resolve peer
+        input_peer = await resolve_peer_helper(username)
+        
+        # Get story
+        result = await user.invoke(GetStoriesByID(peer=input_peer, id=[storyid]))
+        
+        if not result or not result.stories:
+            return JSONResponse(content={
+                "success": False,
+                "error": "Story not found"
+            })
+        
+        story = result.stories[0]
+        
+        # Try to download
+        temp_file = tempfile.NamedTemporaryFile(delete=False, suffix=".tmp")
+        temp_path = temp_file.name
+        temp_file.close()
+        
+        try:
+            # Try direct download
+            file_path = await user.download_media(
+                message=story,
+                file_name=temp_path,
+                progress=None
+            )
+            
+            if file_path and os.path.exists(file_path):
+                file_size = os.path.getsize(file_path)
+                
+                # Clean up
+                os.remove(file_path)
+                
+                return JSONResponse(content={
+                    "success": True,
+                    "message": f"Download successful: {file_size} bytes",
+                    "file_size": file_size,
+                    "media_type": "photo" if hasattr(story.media, 'photo') else "video/document"
+                })
+            else:
+                return JSONResponse(content={
+                    "success": False,
+                    "error": "Download returned no file path"
+                })
+                
+        except Exception as e:
+            if os.path.exists(temp_path):
+                os.remove(temp_path)
+            
+            return JSONResponse(content={
+                "success": False,
+                "error": f"Download failed: {str(e)}",
+                "traceback": str(e.__traceback__)
+            })
+        
+    except Exception as e:
+        logger.error(f"Debug error: {str(e)}", exc_info=True)
+        return JSONResponse(content={
+            "success": False,
+            "error": str(e),
+            "traceback": str(e.__traceback__) if hasattr(e, '__traceback__') else "No traceback"
+        })
+
 if __name__ == "__main__":
     local_ip = get_local_ip()
     print(f"\n{'='*60}")
-    print(f"Telegram Stories API Server (Enhanced Version)")
+    print(f"Telegram Stories API Server (Fixed Download Version)")
     print(f"{'='*60}")
     print(f"Local IP: {local_ip}")
     print(f"Port: 4747")
@@ -746,9 +790,10 @@ if __name__ == "__main__":
     print(f"  - /api/all?username=<username>")
     print(f"  - /api/special?username=<username>&storyid=<id>")
     print(f"  - /api/direct?url=<telegram_story_url>")
-    print(f"  - /api/check?username=<username>&storyid=<id> (NEW)")
+    print(f"  - /api/check?username=<username>&storyid=<id>")
+    print(f"  - /api/debug_download?username=<username>&storyid=<id> (DEBUG)")
     print(f"{'='*60}")
-    print(f"Note: Some stories may not be accessible due to privacy settings.")
+    print(f"Note: Using simplified download method for better reliability")
     print(f"{'='*60}\n")
     
     uvicorn.run(app, host="0.0.0.0", port=4747, loop="uvloop")
