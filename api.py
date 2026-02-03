@@ -122,36 +122,83 @@ async def upload_to_tmpfiles(file_path):
         return None
 
 def parse_story_url(url):
+    """
+    Parse Telegram story URL and extract username/chat_id and story_id
+    Supports:
+    - t.me/username/s/story_id
+    - t.me/c/chat_id/story_id
+    """
     patterns = [
         r't\.me/([^/]+)/s/(\d+)',
         r'telegram\.me/([^/]+)/s/(\d+)',
         r't\.me/c/(\d+)/(\d+)',
-        r'telegram\.me/c/(\d+)/(\d+)'
+        r'telegram\.me/c/(\d+)/(\d+)',
+        r't\.me/([^/]+)/(\d+)',  # Alternative format
+        r'telegram\.me/([^/]+)/(\d+)'  # Alternative format
     ]
     
     for pattern in patterns:
         match = re.search(pattern, url)
         if match:
-            username = match.group(1)
-            story_id = int(match.group(2))
-            return username, story_id
+            # Check if it's a channel/c format (c/12345)
+            if pattern.startswith(r't\.me/c/') or pattern.startswith(r'telegram\.me/c/'):
+                chat_id = match.group(1)
+                story_id = int(match.group(2))
+                # For channels, we need to add 1000000000000
+                try:
+                    chat_id_int = int(chat_id)
+                    return f"-100{chat_id_int}", story_id
+                except ValueError:
+                    return None, None
+            else:
+                username = match.group(1)
+                story_id = int(match.group(2))
+                return username, story_id
     
     return None, None
 
-async def resolve_peer_helper(username):
-    peer = await user.resolve_peer(username)
-    if hasattr(peer, 'user_id'):
-        return InputPeerUser(
-            user_id=peer.user_id,
-            access_hash=peer.access_hash
-        )
-    elif hasattr(peer, 'channel_id'):
-        return InputPeerChannel(
-            channel_id=peer.channel_id,
-            access_hash=peer.access_hash
-        )
-    else:
-        raise HTTPException(status_code=400, detail="Unsupported peer type")
+async def resolve_peer_helper(username_or_id):
+    """
+    Resolve peer from username or chat_id
+    """
+    try:
+        # Check if it's a numeric ID (channel)
+        if isinstance(username_or_id, str) and username_or_id.startswith("-100"):
+            try:
+                channel_id = int(username_or_id[4:])  # Remove "-100"
+                # Create InputPeerChannel
+                # Note: You'll need the access_hash for channels
+                # This is a simplified version
+                peer = await user.resolve_peer(username_or_id)
+                if hasattr(peer, 'channel_id'):
+                    return InputPeerChannel(
+                        channel_id=peer.channel_id,
+                        access_hash=peer.access_hash
+                    )
+            except:
+                pass
+        
+        # For usernames
+        peer = await user.resolve_peer(username_or_id)
+        if hasattr(peer, 'user_id'):
+            return InputPeerUser(
+                user_id=peer.user_id,
+                access_hash=peer.access_hash
+            )
+        elif hasattr(peer, 'channel_id'):
+            return InputPeerChannel(
+                channel_id=peer.channel_id,
+                access_hash=peer.access_hash
+            )
+        elif hasattr(peer, 'chat_id'):
+            # For groups
+            raise HTTPException(status_code=400, detail="Groups are not supported for stories")
+        else:
+            raise HTTPException(status_code=400, detail="Unsupported peer type")
+            
+    except Exception as e:
+        logger.error(f"Failed to resolve peer {username_or_id}: {str(e)}")
+        raise HTTPException(status_code=400, detail=f"Failed to resolve peer: {str(e)}")
 
 def format_story_info(story, story_type):
     story_date = datetime.fromtimestamp(story.date).strftime("%Y-%m-%d %H:%M:%S")
@@ -166,12 +213,16 @@ def format_story_info(story, story_type):
         "has_media": hasattr(story, 'media')
     }
 
-async def find_and_download_story(username, storyid):
-    input_peer = await resolve_peer_helper(username)
+async def find_and_download_story(username_or_id, storyid):
+    try:
+        input_peer = await resolve_peer_helper(username_or_id)
+    except HTTPException:
+        return None
     
     target_story = None
     story_type = None
     
+    # Search in active stories
     try:
         active_result = await user.invoke(
             GetPeerStories(peer=input_peer)
@@ -182,9 +233,10 @@ async def find_and_download_story(username, storyid):
                     target_story = story
                     story_type = "Active"
                     break
-    except:
-        pass
+    except Exception as e:
+        logger.warning(f"No active stories or error: {str(e)}")
     
+    # Search in pinned stories
     if not target_story:
         try:
             pinned_result = await user.invoke(
@@ -200,9 +252,10 @@ async def find_and_download_story(username, storyid):
                         target_story = story
                         story_type = "Pinned"
                         break
-        except:
-            pass
+        except Exception as e:
+            logger.warning(f"No pinned stories or error: {str(e)}")
     
+    # Search in archived stories
     if not target_story:
         try:
             offset_id = 0
@@ -231,12 +284,13 @@ async def find_and_download_story(username, storyid):
                     break
                 
                 offset_id = archive_result.stories[-1].id
-        except:
-            pass
+        except Exception as e:
+            logger.warning(f"No archived stories or error: {str(e)}")
     
     if not target_story:
         return None
     
+    # Download the story media
     story_date = datetime.fromtimestamp(target_story.date).strftime("%Y-%m-%d %H:%M:%S")
     caption = getattr(target_story, 'caption', '') if hasattr(target_story, 'caption') else ''
     
@@ -246,17 +300,21 @@ async def find_and_download_story(username, storyid):
     
     if hasattr(media, 'photo'):
         media_type = "photo"
-        file_id_obj = FileId(
-            file_type=FileType.PHOTO,
-            dc_id=media.photo.dc_id,
-            media_id=media.photo.id,
-            access_hash=media.photo.access_hash,
-            file_reference=media.photo.file_reference,
-            thumbnail_source=ThumbnailSource.THUMBNAIL,
-            thumbnail_file_type=FileType.PHOTO,
-            thumbnail_size=""
-        )
-        file_path = await user.download_media(file_id_obj.encode(), file_name="/tmp/")
+        try:
+            file_id_obj = FileId(
+                file_type=FileType.PHOTO,
+                dc_id=media.photo.dc_id,
+                media_id=media.photo.id,
+                access_hash=media.photo.access_hash,
+                file_reference=media.photo.file_reference,
+                thumbnail_source=ThumbnailSource.THUMBNAIL,
+                thumbnail_file_type=FileType.PHOTO,
+                thumbnail_size=""
+            )
+            file_path = await user.download_media(file_id_obj.encode(), file_name="/tmp/")
+        except Exception as e:
+            logger.error(f"Error downloading photo: {str(e)}")
+            return None
         
     elif hasattr(media, 'document'):
         doc = media.document
@@ -265,26 +323,40 @@ async def find_and_download_story(username, storyid):
         if mime_type.startswith('video'):
             media_type = "video"
             file_type = FileType.VIDEO
+        elif mime_type.startswith('image'):
+            media_type = "image"
+            file_type = FileType.PHOTO
         else:
             media_type = "document"
             file_type = FileType.DOCUMENT
         
-        file_id_obj = FileId(
-            file_type=file_type,
-            dc_id=doc.dc_id,
-            media_id=doc.id,
-            access_hash=doc.access_hash,
-            file_reference=doc.file_reference,
-            thumbnail_source=ThumbnailSource.THUMBNAIL,
-            thumbnail_file_type=FileType.PHOTO,
-            thumbnail_size=""
-        )
-        file_path = await user.download_media(file_id_obj.encode(), file_name="/tmp/")
+        try:
+            file_id_obj = FileId(
+                file_type=file_type,
+                dc_id=doc.dc_id,
+                media_id=doc.id,
+                access_hash=doc.access_hash,
+                file_reference=doc.file_reference,
+                thumbnail_source=ThumbnailSource.THUMBNAIL,
+                thumbnail_file_type=FileType.PHOTO,
+                thumbnail_size=""
+            )
+            file_path = await user.download_media(file_id_obj.encode(), file_name="/tmp/")
+        except Exception as e:
+            logger.error(f"Error downloading document: {str(e)}")
+            return None
     else:
+        logger.warning(f"Unsupported media type: {type(media)}")
         return None
     
+    if not file_path or not os.path.exists(file_path):
+        logger.error(f"Failed to download story media")
+        return None
+    
+    # Upload to temporary file host
     upload_url = await upload_to_tmpfiles(file_path)
     
+    # Clean up local file
     if os.path.exists(file_path):
         os.remove(file_path)
     
@@ -293,7 +365,7 @@ async def find_and_download_story(username, storyid):
     
     return {
         "success": True,
-        "username": username,
+        "username": username_or_id,
         "story_id": storyid,
         "type": story_type,
         "media_type": media_type,
@@ -510,19 +582,22 @@ async def download_story_direct(url: str):
         
         logger.info(f"Processing direct URL: {url}")
         
-        username, story_id = parse_story_url(url)
+        username_or_id, story_id = parse_story_url(url)
         
-        if not username or not story_id:
+        if not username_or_id or not story_id:
             return JSONResponse(content={
                 "success": False,
-                "error": "Invalid Telegram story URL format. Expected format: https://t.me/username/s/storyid",
+                "error": "Invalid Telegram story URL format. Expected formats:\n"
+                        "1. https://t.me/username/s/story_id\n"
+                        "2. https://t.me/c/1234567890/story_id\n"
+                        "3. https://t.me/username/story_id",
                 "api_dev": "@ISmartCoder",
                 "api_channel": "@abirxdhackz"
             }, status_code=400)
         
-        logger.info(f"Extracted username: {username}, story_id: {story_id}")
+        logger.info(f"Extracted: {username_or_id}, story_id: {story_id}")
         
-        result = await find_and_download_story(username, story_id)
+        result = await find_and_download_story(username_or_id, story_id)
         
         if not result:
             return JSONResponse(content={
