@@ -20,9 +20,9 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 # Telegram credentials from environment variables (for Vercel)
-API_ID = int(os.getenv("API_ID", 123456))
-API_HASH = os.getenv("API_HASH", "")
-SESSION_STRING = os.getenv("SESSION_STRING", "")
+API_ID = int(os.getenv("API_ID", 28426910))
+API_HASH = os.getenv("API_HASH", "14824e6e01b1b6e6bef683c3e1797821")
+SESSION_STRING = os.getenv("SESSION_STRING", "AQF722MAdGPFXOVUJ3QWo-FXtQSkKFMMhCfF8rUNsK4fSao6j4x1nmwntswCcoJ7HuvimpdCN_uwj7OtABxPy5f6ICPfYbEqeAYZFhvQDi8EuTm8zX7bJqlY2P_lKVmhMLtPlKWJhYRpnQ23bV2uApUO3rljn0Z885d0igTqe-d5nDvrSR2XzRSSPj4OP77RVjd_cVSETxZ3HpeqAX8lVEZBigDd59_sQ0BJdRS3DMTBtkqzGPPK2C75jEWymebSeN_UWb9aV-gEWrbPmF_plQusjrXeqKlBUu3eAwtxYIYQ5RGfylq9vQuOq_Sc4gLWEGRC-NzY4Il_FO0QaqNEzx9VkQXGOgAAAAFw2qiqAA")
 
 # Initialize client
 user_client = None
